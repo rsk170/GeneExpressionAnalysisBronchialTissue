@@ -1,0 +1,16 @@
+Package: IEOproject
+Type: Package
+Title: IEO Project Template
+Version: 1.2.4
+Author: Radostina Kisleva, Tamara-Dora Veres, Emma Juan Salazar
+Maintainer: Robert Castelo <robert.castelo@upf.edu>
+Description: Provide the IEO project template.
+License: Artistic-2.0
+Encoding: UTF-8
+Depends: R (>= 4.0.0), SummarizedExperiment
+Imports: methods, S4Vectors, magick, limma, fgsea, GSEABase, GSVAdata, dplyr, msigdbr
+Suggests: BiocStyle, knitr, rmarkdown, usethis, here, kableExtra,
+          edgeR, geneplotter, sva, KernSmooth, ggplot2, RColorBrewer,
+          GOstats, org.Hs.eg.db
+VignetteBuilder: knitr
+RoxygenNote: 7.3.1

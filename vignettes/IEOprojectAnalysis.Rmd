@@ -1,0 +1,1602 @@
+---
+title: "Gene Expression Analysis of RNA-seq in Bronchial Tissue: Premalignant Lung Lesions and Current Smoking Status"
+author:
+- name: "Radostina Kisleva, Emma Juan Salazar, Tamara-Dora Veres"
+  affiliation: Universitat Pompeu Fabra
+  email: radostina.kisleva01@estudiant.upf.edu,  emma.juan01@estudiant.upf.edu,  tamaradora.veres01@estudiant.upf.edu
+date: "`r Sys.Date()`"
+output:
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    fig_captions: yes
+bibliography: bibliography.bib
+vignette: >
+  %\VignetteIndexEntry{IEOprojectAnalysis}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+<!--
+In this first chunk of code, which will not be shown in the resulting
+document (echo=FALSE) sets up global processing options, such as whether
+a comment character should appear before code results (set to the null
+character string in this case), collapse source and output blocks into
+a single code block (collapse=TRUE), align figures to the center
+(fig.align="center") or cache the results to speed up vignette building
+(cache=FALSE thus disabled in this case). A full description of possible
+options can be found at http://yihui.name/knitr/options
+--->
+
+```{r setup, echo=FALSE, cache=FALSE}
+library(knitr) ## kable()
+library(kableExtra) ## kable_styling(), save_kable()
+library(here) ## here()
+library(usethis) ## use_directory()
+
+knitr::opts_chunk$set(
+  collapse=TRUE,
+  comment="",
+  fig.align="center",
+  fig.wide=TRUE,
+  cache=FALSE
+)
+
+## this option avoid use_directory() being verbose
+options(usethis.quiet=TRUE)
+
+## create these paths at build time if they do not exist
+use_directory(file.path("doc"))
+use_directory(file.path("inst", "doc"))
+
+## fetch the package root directory
+path2pkg <- here()
+
+```
+
+# Introduction
+
+Lung cancer is the leading cause of cancer-related death in the United
+States. The molecular events preceding the onset of disease are poorly
+understood, and no effective tools exist to identify smokers with
+premalignant lesions (PMLs) that will progress to invasive cancer.
+Previous research has identified molecular changes in the smoke-exposed
+airways. However, the focus of the paper "Detecting the Presence and
+Progression of Premalignant Lung Lesions via Airway Gene
+Expression" @Beane17 shifts the focus to the first stages of the disease progress.
+They utilize samples from the same
+airway field of injury to study PMLs and their potential in preventing
+lung cancer.
+
+The researchers' goal is to profile samples extracted from normal
+appearing bronchial mucosa by mRNA-Seq, and attempt to find
+differentially expressed gene sets and pathways between subjects with
+PMLs and without PMLs. From the original 82 samples, 50 subjects had
+PML, 25 didn't, and 7 were excluded in the end.
+
+The resulting raw RNA-seq data has been deposited at the Gene
+Expression Omnibus (GEO), where they are publicly available under
+accession [GSE79209](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE79209).
+
+In this analysis, we attempted to formulate a new question to answer, using the dataset of the mentioned paper.
+
+We'll perform an Exploratory Data Analysis of the corresponding RNA-seq gene expression profiles generated as a table of counts using the DEE2 (<https://dee2.io>) pipeline by @ziemann19, and further packaged into a [SummarizedExperiment](https://bioconductor.org/packages/SummarizedExperiment) object with genes mapped to Entrez identifiers. This object also stores the phenotypic information about the profiled samples that has been also made available at GEO.
+
+The EDA will allow us to look further into the dataset and have enough information for a new Experimental Design. Hierarchical clustering and batch identification will assist us in choosing a new way to group the 82 samples, with the goal of finding differentially expressed genes. We will perform functional enrichment analysis to analyse high-throughput experimental results in order to discover biological annotations that are over-represented in the list of DE genes.
+
+# Quality assessment
+
+## Data import and cleaning
+
+We start by importing the raw table of counts.
+
+<!--
+The option 'message=FALSE' avoid dumping R messages such as "Loading required package: methods"
+into the output of the report.
+-->
+
+```{r, message=FALSE}
+library(SummarizedExperiment)
+
+se <- readRDS(file.path(system.file("extdata",
+                                    package="IEOproject"),
+                        "GSE79209.rds"))
+se
+
+```
+
+We have `r nrow(se)` genes by `r ncol(se)` samples. From the first row
+and column names shown by the object, we can figure out that genes are
+defined by [Entrez](https://www.ncbi.nlm.nih.gov/gene) [@maglott10]
+identifiers and samples by Sequence Read Archive Run
+([SRR](https://www.ncbi.nlm.nih.gov/books/NBK56913/#search.what_do_the_different_sra_accessi)) identifiers.
+
+The row data in this object contains information about the profiled genes.
+
+```{r}
+head(rowData(se))
+```
+Among this information, the gene symbol and description are potentially
+useful for interpreting results of, for instance, a differential
+expression analysis.
+
+### Exploratory Data Analysis
+
+Let's explore the information we have for the samples: phenotypical
+and technical data.
+
+Conducting exploratory data analysis (EDA) will enable us to identify the number of phenotypical variables, the technical variables, and potential areas of interest for future experimental design.
+
+```{r}
+dim(colData(se))
+head(colData(se), n=3)
+```
+
+We have a total of `r ncol(colData(se))` phenotypical variables.
+
+To get a sense of what we have, we can look at the column names:
+
+```{r}
+colnames(colData(se))
+```
+
+The second column `geo_accession` contains GEO Sample Accession Number
+([GSM](https://www.ncbi.nlm.nih.gov/geo/info/overview.html)) identifers.
+GSM identifiers define individual samples, understood in our context as
+individual sources of RNA. We can check if we have any technical replicates
+as follows:
+
+```{r}
+length(unique(se$geo_accession))
+table(lengths(split(colnames(se), se$geo_accession)))
+```
+
+So, we have `r length(unique(se$geo_accession))` different individual
+samples which matches the number of samples that we have - `r ncol(se)`.
+Therefore we don't have any technical replicates and we can proceed with
+the next step.
+
+To proceed further exploring the dataset, we are going to use the
+[edgeR](https://bioconductor.org/packages/edgeR) package and build
+a `DGEList` object, incorporating the gene metadata, which includes
+the gene symbol.
+
+```{r, message=FALSE}
+library(edgeR)
+
+dge <- DGEList(counts=assays(se)$counts, genes=rowData(se))
+head(dge$samples, 3)
+dim(dge)
+```
+Calculate $\log_2$ CPM units of expression and put them as an
+additional assay element to ease their manipulation. This provides a
+standarized and normalized representation of gene expression data.
+
+```{r}
+assays(se)$logCPM <- cpm(dge, log=TRUE)
+assays(se)$logCPM[1:5, 1:5]
+```
+
+Let's explore now some of the phenotypical variables.
+
+To identify the columns that will be useful, we need to examine the number of unique values (levels) of each variable to determine their suitability for grouping samples. Variables with only one unique value or more than 80 unique values are not of interest. Therefore, we aim to create a list of columns with an appropriate number of unique values.
+
+```{r}
+interesting_se <- data.frame(row.names=se$title)
+technical_se <- data.frame(row.names=se$title)
+for(column in colnames(colData(se))){
+  se[[column]] <- factor(se[[column]])
+  if(length(levels(se[[column]]))>1 && length(levels(se[[column]]))<81){
+    interesting_se[[column]] <- se[[column]]
+  } else{
+    technical_se[[column]] <- se[[column]]
+  }
+}
+```
+
+Once we obtain the variables, we can now look at their levels to see what
+type of data they offer
+
+```{r}
+head(interesting_se)
+```
+
+Using this list, we identify 8 phenotypical (or environmental) variables of interest:
+
+**Age** (characteristics_ch1.1)
+
+**Sex** (characteristics_ch1.2)
+
+**Smoking status** (characteristics_ch1.3): Current smoker or Former
+smoker
+
+**Pack years** (characteristics_ch1.4): how many cigarettes a person has
+smoked in their lifetime
+
+**COPD Status** (characteristics_ch1.1): Chronic obstructive pulmonary
+disease
+
+**Mean GC Content** (characteristics_ch1.18)
+
+**Max Histology** (characteristics_ch1.6): Histology types (tissue
+characteristics)
+
+-   This variable determines what they'll call dysplasia status (see
+    next variable). 
+    -   **Dysplasia** includes samples that have:
+
+        -   Mild Dysplasia
+
+        -   Moderate Dysplasia
+
+        -   Severe Dysplasia
+
+    -   **No Dysplasia** includes samples that have:
+
+        -   Hyperplasia
+
+        -   Normal histology
+
+    -   Samples that had **metaplasia** were excluded from the analysis
+
+**Dysplasia Status** (characteristics_ch1.7)
+
+-   Dysplasia 
+
+-   No Dysplasia
+
+-   Metaplasia
+
+To facilitate handling this variables we are going to perform the following
+modifications:
+
+```{r}
+se$sex <- gsub("Sex: ", "", se$characteristics_ch1.2)
+se$sex <- factor(se$sex, levels = c("Male", "Female"))
+
+se$smoker <- gsub("smoking status: ", "", se$characteristics_ch1.3)
+se$smoker <- factor(se$smoker, levels = c("Current smoker", "Former smoker"))
+
+se$copd_status <- gsub("copd status: ", "", se$characteristics_ch1.5)
+se$copd_status <- factor(se$copd_status, levels = c("COPD", "No COPD"))
+
+se$histology <- gsub("max histology: ", "", se$characteristics_ch1.6)
+se$histology <- factor(se$histology, levels(se$histology) <- c("Hyperplasia", "Metaplasia", "Mild dysplasia", "Moderate dysplasia", "Normal", "Severe dysplasia"))
+
+se$dysplasia <- gsub("Subject L.*, ", "", se$title)
+se$dysplasia <- factor(se$dysplasia)
+```
+
+To faciliate working with the pack years variable, we will split it into four 
+categorical groups - Low, Medium, High and Very high. 
+
+To do that we will:  
+1. Calculate quartiles for the data.  
+2. Assign categories based on quartile ranges.  
+3. Convert the values into their corresponding categories.  
+
+
+```{r}
+se$characteristics_ch1.4 <- gsub("pack years: ", "", se$characteristics_ch1.4)
+class(se$characteristics_ch1.4)
+se$characteristics_ch1.4 <- as.numeric(se$characteristics_ch1.4)
+
+quartiles <- quantile(se$characteristics_ch1.4, probs = c(0.25, 0.5, 0.75))
+```
+
+Now that we have the quartiles, we can proceed to assign categories to the values based on these quartiles.
+
+Values below the first quartile (Q1) will be categorized as "low."
+Values between Q1 and the median (Q2) will be categorized as "medium."
+Values between the median (Q2) and the third quartile (Q3) will be categorized as "high."
+Values above the third quartile (Q3) will be categorized as "very high."
+
+
+```{r}
+
+se$pack_years <- cut(se$characteristics_ch1.4,
+                          breaks = c(-Inf, quartiles[1], quartiles[2], quartiles[3], Inf),
+                          labels = c("Low", "Medium", "High", "Very High"),
+                          include.lowest = TRUE)
+
+```
+
+We will do the same with the age variable -split it into four
+intervals.
+
+To do that we will:\
+1. Calculate quartiles for the data.\
+2. Assign categories based on quartile ranges.\
+3. Convert the values into their corresponding categories.
+
+```{r}
+
+se$age <- gsub("age: ", "", se$characteristics_ch1.1)
+class(se$age)
+se$age <- as.numeric(se$age)
+
+quartiles <- quantile(se$age, probs = c(0.25, 0.5, 0.75))
+quartiles
+
+```
+
+Values below the first quartile (Q1) will be categorized as "low."
+Values between Q1 and the median (Q2) will be categorized as "medium."
+Values between the median (Q2) and the third quartile (Q3) will be
+categorized as "high." Values above the third quartile (Q3) will be
+categorized as "very high."
+
+```{r}
+se$age_intervals <- cut(se$age,
+                          breaks = c(-Inf, quartiles[1], quartiles[2], quartiles[3], Inf),
+                          labels = c("age <= 58", "58 < age <= 64", "64 < age <= 69", "69 < age"),
+                          include.lowest = TRUE)
+
+```
+
+In Table \@ref(tab:pheno) below, we show the five variables of interest
+(smoking status, pack years, histology, dysplasia and COPD status)
+jointly to gather as much understanding as possible on the underlying
+experimental design.
+
+
+```{r pheno, echo=FALSE, message=FALSE}
+tmpdf <- data.frame(Identifer=colnames(se),
+                    Age=se$age_intervals,
+                    Sex=se$sex,
+                    "Smokeing status"=se$smoker,
+                    "Pack Years"=se$pack_years,
+                    "COPD Status"=se$copd_status,
+                    Histology=se$histology,
+                    Dysplasia=se$dysplasia,
+                    check.names=FALSE)
+ktab <- kable(tmpdf, caption="Phenotypical variables.")
+ktab <- kable_styling(ktab, position="center")
+
+
+```
+
+## Sequencing depth
+
+In the following step we will evaluate the sequencing depth in terms of the total number of read counts that are mapped to each sample's genome. The sequencing depth per sample, commonly referred to as library sizes, is displayed in Figure \@ref(fig:libsizes) below in increasing order. 
+
+```{r libsizes, echo=FALSE, height=8, width=8, out.width="600px", fig.cap="Library sizes in increasing order."}
+par(mar=c(7, 5, 2, 2))
+ord <- order(dge$sample$lib.size/1e6)
+ordmreads <- dge$sample$lib.size[ord]/1e6
+names(ordmreads) <- colnames(se)[ord]
+bp <- barplot(ordmreads, las=1, ylab="Millions of reads",
+              xlab="", col=c("blue", "green", "red", "purple", "orange", "pink")[factor(se$histology[ord])], las=2, ylim = c(0, 50))
+legend("topleft", c("Hyperplasia", "Metaplasia", "Mild dysplasia", "Moderate dysplasia", "Normal", "Severe dysplasia"), fill=c("blue", "green", "red", "purple", "orange", "pink"), inset=0.01, cex=0.85)
+
+```
+
+The plot displays a range of sequencing depths for the samples, each represented by an SRR identifier. The sequencing depth across our samples ranges from 20 to 50 million reads, with the majority falling between 30 to 40 million reads. This indicates a generally high level of coverage, which is beneficial for accurate genomic analysis. The plot also suggests that the highest number of reads corresponds to mild and moderate dysplasia, indicating early stages of cellular abnormalities that could potentially progress to cancer. The predominance of mild dysplasia in these samples could be of particular interest for early detection and intervention studies. There does not appear to be any evident bias in terms of sequencing depth across the conditions represented.
+
+## Distribution of expression levels among samples
+
+Figure \@ref(fig:distRawExp) below shows the distribution of expression
+values per sample in logarithmic CPM units of expression.
+
+
+```{r distRawExp, echo=FALSE, fig.height=5, fig.width=5, out.width="600px", fig.cap="Non-parametric density distribution of expression profiles per sample.", message=FALSE}
+library(geneplotter)
+par(mar=c(4, 5, 1, 1))
+lst <- as.list(as.data.frame(assays(se)$logCPM))
+multidensity(lst, xlab="log 2 CPM", legend=NULL,
+             main="", las=1)
+```
+There are no substantial differences between the samples in the
+distribution of expression values.
+
+## Distribution of expression levels among genes
+
+Let's calculate now the average expression per gene through all the
+samples. Figure \@ref(fig:exprdist) shows the distribution of those
+values across genes.
+
+```{r exprdist, echo=FALSE, out.width="600px", fig.cap="Distribution of average expression level per gene."}
+avgexp <- rowMeans(assays(se)$logCPM)
+hist(avgexp, xlab="log2 CPM", main="", las=1)
+```
+The histogram displays a bimodal distribution, which means there are two distinct peaks. The large peak to the left is the most prominent feature of the histogram, showing that most genes in this dataset are expressed at low levels or possibly not at all, under the conditions of the experiment. On the right part, the peak which indicates that as gene expression levels increase, fewer genes are found at these higher expression levels.
+
+
+## Filtering of lowly-expressed genes
+
+To filter out lowly-expressed genes, we first calculate the row means of the expression data and apply a logical mask to remove genes with an average logCPM ≤ 1. This step refines the dataset and removes noise, ensuring subsequent analysis is based on high-quality data.
+
+Next, we calculate a CPM cutoff based on the smallest library size. We check for any missing values in the histology data to ensure data integrity.
+
+We then focus on filtering genes based on their presence in samples with premalignant lesions (PML), specifically those categorized as "Mild dysplasia", "Moderate dysplasia", and "Severe dysplasia". We count the number of PML samples and calculate the CPM for these samples only.
+
+Finally, we apply a logical mask to retain genes that meet the CPM cutoff in at least the number of PML samples. This two-step filtering process is crucial for refining the dataset and focusing the analysis on genes with relevant expression patterns. Figure \@ref(fig:lowexpgenes) shows the distribution of expression values across genes before and after filtering.
+
+```{r}
+mask_initial <- rowMeans(assays(se)$logCPM) > 1
+se_initial_filt <- se[mask_initial, ]
+dge_initial_filt <- dge[mask_initial, ]
+dim(se_initial_filt)
+
+cpmcutoff <- round(10/min(dge$samples$lib.size/1e6), digits=1)
+cpmcutoff
+
+if(any(is.na(se$histology))) {
+  stop("Missing values found in the histology column.")
+}
+
+pml_status <- se$histology %in% c("Mild dysplasia", "Moderate dysplasia", "Severe dysplasia")
+nsamplescutoff <- sum(pml_status)
+nsamplescutoff
+
+pml_indices <- which(pml_status)
+
+cpm_pml <- cpm(dge_initial_filt)[, pml_indices]
+
+mask_final <- rowSums(cpm_pml > cpmcutoff) >= nsamplescutoff
+sum(mask_final)
+se.filt <- se_initial_filt[mask_final, ]
+dge.filt <- dge_initial_filt[mask_final, ]
+dim(se.filt)
+```
+
+```{r lowexpgenes, echo=FALSE, out.width="600px", fig.cap="Distribution of lowly-expressed genes."}
+par(mar=c(4, 5, 1, 1))
+avgexp <- rowMeans(assays(se)$logCPM)
+h <- hist(avgexp, xlab=expression("Expression level (" * log[2] * "CPM)"),
+          main="", las=1, col="grey", cex.axis=1.2, cex.lab=1.5)
+x <- cut(rowMeans(assays(se.filt)$logCPM), breaks=h$breaks)
+lines(h$mids, table(x), type="h", lwd=10, lend=1, col="red")
+legend("topright", c("All genes", "Filtered genes"), fill=c("grey", "red"))
+
+```
+
+We are left with `r nrow(se.filt)` genes.
+
+## Normalization
+
+We calculate the normalization factors on the filtered expression
+data set.
+
+```{r}
+dge.filt <- calcNormFactors(dge.filt)
+```
+
+Replace the raw log2 CPM units in the corresponding assay element of
+the `SummarizedExperiment` object, by the normalized ones.
+
+```{r}
+assays(se.filt)$logCPM <- cpm(dge.filt, log=TRUE,
+                              normalized.lib.sizes=TRUE)
+```
+
+## MA-plots
+
+We examine now the MA-plots of the normalized expression profiles
+in the figures below.
+
+<!---
+Here we make a MA-plot for each sample. The options 'fig.height'
+and 'fig.width' control the relative image size in *inches*. The
+final image size results from 'height'x'dpi' and 'width'x'dpi',
+where 'dpi' is the image resolution in "dots per inch" (by default
+dpi=72). To scale the image to a desired size use 'out.width' and
+'out.height'. More information at http://yihui.name/knitr/options
+--->
+```{r maPlots, fig.height=18, fig.width=10, dpi=100, echo=FALSE, fig.cap="MA-plots of filtered and normalized expression values."}
+par(mfrow=c(5, 4), mar=c(4, 5, 3, 1))
+for (i in 1:ncol(se.filt)) {
+  A <- rowMeans(assays(se.filt)$logCPM)
+  M <- assays(se.filt)$logCPM[, i] - A
+  smoothScatter(A, M, main=colnames(se.filt)[i], las=1)
+  abline(h=0, col="blue", lwd=2)
+  lo <- lowess(M ~ A)
+  lines(lo$x, lo$y, col="red", lwd=2)
+}
+```
+
+For genes above the horizontal line at M=0, expression is higher in the condition being tested against the reference, as for genes below, expression is lower.
+The red line represents a loose fit to the data, which should ideally be around M=0 if there is no differential expression between conditions. Any systematic deviation from M=0 indicates potential bias or systematic variation in the data. In most of the plots, the red line remains close to M=0 across the range of A values, indicating no systematic bias in expression changes relative to gene abundance.
+Some plots show a slight dip in the loose line at the lower end of the A scale, suggesting a potential bias for lowly expressed genes which could be potential candidates for differential expression. These points would be of interest for follow-up analyses.
+
+## Experimental design and batch identification
+
+### Technical variables
+
+To identify potential columns which could constitute unwanted variability, we looked at columns that contain information related to technical aspects, experimental conditions or processing details that could vary between different batches. 
+
+When doing EDA, we created a dataframe with all the phenotypical
+variables, and another one with the technical ones.
+
+```{r}
+head(technical_se, n=3)
+```
+
+Here are some columns which we thought could introduce unwanted variability: `submission_date`, `last_update_date`, `type`, `channel_count`, `extract_protocol_ch1`, `extract_protocol_ch1.1`, `data_processing`, `data_processing.1`, `data_processing.2`, `data_processing.3`, `data_processing.4`, `data_processing.5`, `data_processing.6`, `platform_id`, `instrument_model`, `library_selection`, `library_source`, `library_strategy`.
+
+These variables have the same values across all samples which suggests that they are not contributing to the variability of the dataset. For example:
+```{r}
+table(se.filt$histology, se.filt$library_strategy)
+```
+
+There is perfect correlation between library strategy and histology. This means that differences between our samples will be due to biological differences rather than technical. 
+
+We can discard all of the variables that have the same value across all
+samples:
+
+```{r}
+deleted <- c()
+for(column in colnames(technical_se)){
+  if(length(levels(technical_se[[column]]))==1){
+    technical_se[[column]] <- NULL
+    deleted <- c(deleted, c(column))
+  }
+}
+head(deleted)
+```
+
+The rest of the variables are related to technical aspects
+related to the sequencing that's specific to every sample, therefore we can discard them as sources of unwanted variability.
+
+### Phenotypical Variables
+
+We have to now take a look at how our phenotypical variables interact
+and whether they might explain any sample clustering we may find, to help
+us make a decision on what groups to choose for our DE analysis.
+
+First, let's examine the distribution between **dysplasia** and [histology]{.underline}.
+
+```{r}
+table(se.filt$dysplasia, se.filt$histology)
+```
+
+This is a very obvious result, since we know dysplasia was drawn from
+the histology variable. This is a great example of combinations that
+aren't sequenced (in this case, because they can't exist.)
+
+We can also examine the distribution between histology and our other
+prototypical variables
+
+```{r}
+table(se.filt$histology, se.filt$age_intervals)
+table(se.filt$histology, se.filt$sex)
+table(se.filt$histology, se.filt$pack_years)
+table(se.filt$histology, se.filt$copd_status)
+```
+
+We can see that not all combinations of pack-years and histology have
+been sequenced. Some combinations have missing values, indicated by 0s.
+
+It's interesting to note that the 0s indicate:
+
+-   Groups like low or medium pack years (people that have smoked less
+    cigarettes over the course of their lives) have no samples with
+    severe dysplasia, meaning severe detriment to their bronchial
+    tissue.
+
+-   There's also no females with severe dysplasia.
+
+-   And the severe dysplasia group also lacks samples on the younger age
+    interval.
+
+The distribution we're interested in, however, is the one between these
+phenotypical variables and the dysplasia variable (same concept as
+histology, but grouped in three groups)
+
+```{r}
+table(se.filt$dysplasia, se.filt$age_intervals)
+table(se.filt$dysplasia, se.filt$sex)
+table(se.filt$dysplasia, se.filt$pack_years)
+table(se.filt$dysplasia, se.filt$copd_status)
+```
+
+We can see that we have sequences for all of these different
+combinations.
+
+### Hierarchical Clustering
+
+We examine now how samples group together by hierarchical clustering and
+multidimensional scaling, annotating pack-years and histology. We
+calculate again log CPM values with a high prior count (3) to moderate
+extreme fold-changes produced by low counts. The resulting dendrogram is
+shown in Figure \@ref(fig:sampleClustering).
+
+```{r sampleClustering, fig.height=8, fig.width=10, dpi=100, echo=FALSE, fig.cap="Figure S6: Hierarchical clustering of the samples. Labels correspond to pack-years and sample identifer, while colors indicate histology groups."}
+logCPM <- cpm(dge.filt, log=TRUE, prior.count=3)
+d <- as.dist(1-cor(logCPM, method="spearman"))
+sampleClustering <- hclust(d)
+batch <- as.integer(se.filt$histology)
+sampleDendrogram <- as.dendrogram(sampleClustering, hang=0.1)
+names(batch) <- colnames(se.filt)
+outcome <- paste(se.filt$dysplasia)
+names(outcome) <- colnames(se.filt)
+sampleDendrogram <- dendrapply(sampleDendrogram,
+function(x, batch, labels) {
+  if (is.leaf(x)) {
+    attr(x, "nodePar") <- list(lab.col=as.vector(batch[attr(x,"label")]))
+    attr(x, "label") <- as.vector(labels[attr(x, "label")])
+    }
+  x
+  }, batch, outcome)
+plot(sampleDendrogram, main="Hierarchical clustering of samples", cex=1)
+legend("topright", levels(se.filt$histology),
+       fill=seq_len(nlevels(se.filt$histology)))
+
+```
+
+Samples are linked together based on their similarity, with the branches
+connecting those most similar first. As we move up the tree, the
+connections represent progressively less similar groups until all are
+joined in a single cluster. Samples do not really cluster together by
+histology type, which means histology type is not the primary factor
+driving the similarity or dissimilarity between samples.
+
+If we look more closely at the labels, we can also see even if we look
+at clustering through the 3 dysplasia groups instead of all 6 histology
+groups, there is still no clear clustering.
+
+We can now try to identify a phenotypical variable that will justify
+clustering. 
+
+```{r agePlot, fig.height=8, fig.width=10, dpi=100, echo=FALSE, fig.cap="Figure S6: Hierarchical clustering of the samples. Labels correspond to dysplasia status, while colors indicate age groups."}
+batch <- as.integer(se.filt$age_intervals)
+sampleDendrogram <- as.dendrogram(sampleClustering, hang=0.1)
+names(batch) <- colnames(se.filt)
+outcome <- paste(se.filt$dysplasia)
+names(outcome) <- colnames(se.filt)
+sampleDendrogram <- dendrapply(sampleDendrogram,
+function(x, batch, labels) {
+  if (is.leaf(x)) {
+    attr(x, "nodePar") <- list(lab.col=as.vector(batch[attr(x,"label")]))
+    attr(x, "label") <- as.vector(labels[attr(x, "label")])
+    }
+  x
+  }, batch, outcome)
+plot(sampleDendrogram, main="Hierarchical clustering of samples - Age", cex=1)
+legend("topright", levels(se.filt$age_intervals),
+       fill=seq_len(nlevels(se.filt$age_intervals)))
+```
+
+```{r sexPlot, fig.height=8, fig.width=10, dpi=100, echo=FALSE, fig.cap="Figure S6: Hierarchical clustering of the samples. Labels correspond to dysplasia status, while colors indicate sex groups."}
+batch <- as.integer(se.filt$sex)
+sampleDendrogram <- as.dendrogram(sampleClustering, hang=0.1)
+names(batch) <- colnames(se.filt)
+outcome <- paste(se.filt$dysplasia)
+names(outcome) <- colnames(se.filt)
+sampleDendrogram <- dendrapply(sampleDendrogram,
+function(x, batch, labels) {
+  if (is.leaf(x)) {
+    attr(x, "nodePar") <- list(lab.col=as.vector(batch[attr(x,"label")]))
+    attr(x, "label") <- as.vector(labels[attr(x, "label")])
+    }
+  x
+  }, batch, outcome)
+plot(sampleDendrogram, main="Hierarchical clustering of samples - Sex", cex=1)
+legend("topright", levels(se.filt$sex),
+       fill=seq_len(nlevels(se.filt$sex)))
+```
+
+```{r copdPlot, fig.height=8, fig.width=10, dpi=100, echo=FALSE, fig.cap="Figure S6: Hierarchical clustering of the samples. Labels correspond to dysplasia status, while colors indicate COPD groups."}
+batch <- as.integer(se.filt$age_intervals)
+sampleDendrogram <- as.dendrogram(sampleClustering, hang=0.1)
+names(batch) <- colnames(se.filt)
+outcome <- paste(se.filt$dysplasia)
+names(outcome) <- colnames(se.filt)
+sampleDendrogram <- dendrapply(sampleDendrogram,
+function(x, batch, labels) {
+  if (is.leaf(x)) {
+    attr(x, "nodePar") <- list(lab.col=as.vector(batch[attr(x,"label")]))
+    attr(x, "label") <- as.vector(labels[attr(x, "label")])
+    }
+  x
+  }, batch, outcome)
+plot(sampleDendrogram, main="Hierarchical clustering of samples - COPD", cex=1)
+legend("topright", levels(se.filt$age_intervals),
+       fill=seq_len(nlevels(se.filt$age_intervals)))
+```
+
+```{r smokingStatusPlot, fig.height=8, fig.width=10, dpi=100, echo=FALSE, fig.cap="Figure S6: Hierarchical clustering of the samples. Labels correspond to dysplasia status, while colors indicate smoking status groups."}
+batch <- as.integer(se.filt$smoker)
+sampleDendrogram <- as.dendrogram(sampleClustering, hang=0.1)
+names(batch) <- colnames(se.filt)
+outcome <- paste(se.filt$dysplasia)
+names(outcome) <- colnames(se.filt)
+sampleDendrogram <- dendrapply(sampleDendrogram,
+function(x, batch, labels) {
+  if (is.leaf(x)) {
+    attr(x, "nodePar") <- list(lab.col=as.vector(batch[attr(x,"label")]))
+    attr(x, "label") <- as.vector(labels[attr(x, "label")])
+    }
+  x
+  }, batch, outcome)
+plot(sampleDendrogram, main="Hierarchical clustering of samples - Smoking status", cex=1)
+legend("topright", levels(se.filt$smoker),
+       fill=seq_len(nlevels(se.filt$smoker)))
+```
+
+```{r packYearsPlot, fig.height=8, fig.width=10, dpi=100, echo=FALSE, fig.cap="Figure S6: Hierarchical clustering of the samples. Labels correspond to dysplasia status, while colors indicate pack-years groups."}
+batch <- as.integer(se.filt$pack_years)
+sampleDendrogram <- as.dendrogram(sampleClustering, hang=0.1)
+names(batch) <- colnames(se.filt)
+outcome <- paste(se.filt$dysplasia)
+names(outcome) <- colnames(se.filt)
+sampleDendrogram <- dendrapply(sampleDendrogram,
+function(x, batch, labels) {
+  if (is.leaf(x)) {
+    attr(x, "nodePar") <- list(lab.col=as.vector(batch[attr(x,"label")]))
+    attr(x, "label") <- as.vector(labels[attr(x, "label")])
+    }
+  x
+  }, batch, outcome)
+plot(sampleDendrogram, main="Hierarchical clustering of samples - Pack Years", cex=1)
+legend("topright", levels(se.filt$pack_years),
+       fill=seq_len(nlevels(se.filt$pack_years)))
+```
+
+No clustering is evident in any of the resulting plots except for
+Smoking Status, where we can see some clustering between the two
+categories: Current smoker vs. Former smoker.
+
+In Figure \@ref(fig:mdsPlot) we show the corresponding MDS plot for the
+Smoking Status variable.
+
+```{r mdsPlot, fig.height=5, fig.width=8, dpi=100, echo=FALSE, fig.cap="Figure S7: Multidimensional scaling plot of the samples. Labels correspond to treatment and colors indicate sample group."}
+library(ggplot2)
+library(RColorBrewer)
+
+outcome <- se.filt$smoker
+outcome2 <- se.filt$dysplasia
+names(outcome) <- colnames(se.filt)
+palette <- brewer.pal(3, "Set2")
+
+plotMDS(dge.filt, labels=outcome2, col=palette[as.numeric(outcome)])
+legend("bottomleft",
+       levels(se.filt$smoker),
+       fill=palette[seq_len(nlevels(outcome))],
+       inset=0.05)
+```
+
+We can distinguish more clearly that there are indeed two clusters, one
+for Current smokers and another one for Former smokers. This leads us to
+assume these two groups have significant differences in their gene
+expression.
+
+## Formulating the question to answer 
+
+Our Exploratory Data Analysis and new Experimental Design allowed us to identify a variable that raises interesting questions when faced with the prospect of investigating it: Smoking status.
+
+All of the samples in our dataset have either been or currently are smokers. Based on the results we've obtained on this first part of our project, we've decided to use this variable to design our new groups. We obtain: Current Smokers (n = r length(se.filt$smoker[se.filt$smoker == "Current smoker"])) and Former smokers (n = r length(se.filt$smoker[se.filt$smoker == "Former smoker"])).
+
+We're also interested in looking at another variable, seeing if it has statistically significant results, to be able to compare its findings to the Smoking status analysis. Based on our clustering, we have identified Dysplasia as a variable that clusters. Dysplasia, which is based on Histology level, assessing the damage in the tissue.
+It is relevan to see how Current vs. Former smokers differ and also which processes differentially involved in one of these groups is also related to airway tissue damage.
+
+Our goal is to find differentially expressed gene sets and pathways between these groups. To do so, we'll perform Differential Expression Analysis with Linear Regression models, using Bioconductor's limma pipeline @limma-og @limma-update. The results will be used to perform Functional Analysis using the Bioconductor package GOstats (Gene Ontology), and finally we'll perform Gene Set Enrichment Analysis to obtain our final results.
+
+These results will help us gain an insight into How the genome changes once a person stops smoking, and wether or not pathways invoved in this are also involved in damage to airway tissue.
+
+From hereon, every step will be done once for the Dysplasia grouping (samples with PML vs without) and then for the Smoking status grouping, to obtain our new results.
+
+# Differential expression
+
+The next step is to do a Differential Expression Analysis. At first
+we'll simply use fold-change values to get a first glance at
+differentially expressed genes, and we'll follow that by DE through
+linear regression. We chose to do two separate DE Analysis, based on the
+following variables:
+
+**PML (Premalignant Lesions)**
+
+**Smoking status**
+
+## Fold Change to Analyze Differential Expression
+
+Firstly, a simple way to find differentially expressed genes
+is to simply compare expression levels between the two groups of
+samples.
+
+We can do this using **fold-change**, which compares the mean read
+counts (using the logarithmic scale to try and stabilize variability
+across expression levels).
+
+We'll see how many genes change their expression between the two groups
+using two different classifications.
+
+### Smoking status
+
+Our two groups of samples are: samples of Current Smokers and samples of Former Smokers. We calculate the means of the values of the expression levels.
+
+```{r}
+current <- rowMeans(logCPM[, se.filt$smoker=="Current smoker"])
+former <- rowMeans(logCPM[, se.filt$smoker=="Former smoker"])
+```
+
+We can now calculate fold-change values for each gene in these two
+groups. We'll rank the genes by decreasing absolute value of Fold
+Change, and we'll call differentially expressed genes those that are at
+the top 10.
+
+```{r}
+log2fc_smoker <- current - former
+ranking <- order(abs(log2fc_smoker), decreasing=TRUE)
+fold_change_smoker <- data.frame(EntrezID=names(log2fc_smoker[ranking]),
+                                    Log2FC=round(log2fc_smoker[ranking], digits=3),
+                                    FC=round(2^log2fc_smoker[ranking], digits=3),
+                                    "1/FC"=round(2^(-log2fc_smoker[ranking]), digits=3),
+                                    row.names=rowData(se.filt)$symbol[ranking],
+                                    check.names=FALSE)
+de_fc_smoker <- head(fold_change_smoker, n=10)
+de_fc_smoker
+```
+
+In the resulting Data Frame:
+
+-   If a gene has a **positive** Log2FC value, it means said gene is
+    **FC** times more upregulated in samples that are *Current smokers*
+    compared to in samples that are *Former smokers*.
+
+    -   For example, AKR1B10 is [**26 times more
+        upregulated**]{.underline} in samples that are Current smokers
+        than in samples that are Former smokers
+
+-   If a gene has a **negative** Log2FC value, it means said gene is
+    **1/FC** times more upregulated in samples that are *Former smokers*
+    compared to in samples that are *Current smokers*.
+
+We can clearly see the difference of expression between groups is larger
+with the smoking status distinction than the dysplasia one.
+
+### PML (Dysplasia)
+
+The two main groups we want to contrast are samples with dysplasia and samples without it. That is why our outcome target is
+Dysplasia.
+
+```{r}
+no_dysplasia <- rowMeans(logCPM[, se.filt$dysplasia=="no dysplasia"])
+dysplasia <- rowMeans(logCPM[, se.filt$dysplasia=="dysplasia"])
+```
+
+We can now calculate fold-change values for each gene in these two
+groups.
+
+```{r}
+log2fc_dysplasia <- dysplasia - no_dysplasia
+ranking <- order(abs(log2fc_dysplasia), decreasing=TRUE)
+fold_change_dysplasia <- data.frame(EntrezID=names(log2fc_dysplasia[ranking]),
+                                    Log2FC=round(log2fc_dysplasia[ranking], digits=3),
+                                    FC=round(2^log2fc_dysplasia[ranking], digits=3),
+                                    "1/FC"=round(2^(-log2fc_dysplasia[ranking]), digits=3),
+                                    row.names=rowData(se.filt)$symbol[ranking],
+                                    check.names=FALSE)
+de_fc_dysplasia <- head(fold_change_dysplasia, n=10)
+de_fc_dysplasia
+```
+
+In the resulting Data Frame:
+
+-   If a gene has a **positive** Log2FC value, it means said gene is
+    **FC** times more upregulated in samples with *Dysplasia* compared
+    to in samples *without Dysplasia*.
+
+-   If a gene has a **negative** Log2FC value, it means said gene is
+    **1/FC** times more upregulated in patients *without Dysplasia*
+    compared to in patients with *Dysplasia*
+
+    -   For example, CLDN18 is more upregulated in samples with
+        Dysplasia than in samples without Dysplasia
+
+## Linear Regression to analyze Differential Expression
+
+We will now use Linear Regression Models to perform our Differential
+Expression, using the **limma pipeline**.
+
+```{r}
+library(limma)
+```
+
+We'll use the same two groupings, and use the followings steps:
+
+1.  Build our design matrix
+2.  Fit the linear model
+3.  Calculate moderated *t*-statistics
+4.  And finally we'll output the results, and get our list of
+    differentially expressed Genes.
+
+### Smoking status
+
+We will start with smoking status since the fold-change values are
+higher and it probably means we'll need less adjusting during the
+process (and it'll be simpler).
+
+First, we build our design matrix.
+
+```{r}
+mod <- model.matrix(~ smoker, data=colData(se.filt))
+head(mod)
+```
+
+Next, we fit the linear regression model
+
+```{r}
+fit <- lmFit(assays(se.filt)$logCPM, mod)
+```
+
+We calculate moderated *t-*statistics
+
+```{r}
+fit <- eBayes(fit)
+```
+
+A quick overview of the results for FDR p-value cutoff at 5% (default)
+
+```{r}
+res <- decideTests(fit)
+summary(res)
+
+summary(res)[1,2] + summary(res)[3,2]
+```
+
+We have `r summary(res)[1,2]` downregulated genes, and
+`r summary(res)[3,2]` upregulated genes, a total of
+`r summary(res)[1,2] + summary(res)[3,2]`.
+
+Seeing these results, we can afford to be a little more restricting with
+the FDR cut-off. We'll fetch the results with a p-value cut-off of
+0,001%.
+
+```{r}
+res <- decideTests(fit, p.value=0.00001)
+summary(res)
+
+summary(res)[1,2] + summary(res)[3,2]
+```
+
+We now have `r summary(res)[1,2]` downregulated genes, and
+`r summary(res)[3,2]` upregulated genes, a total of
+`r summary(res)[1,2] + summary(res)[3,2]`.
+
+And a more detailed view of the results (we'll be sure to add more
+information about the genes, so as to not only have the EntrezID
+identifier as rowname).
+
+The entire table, with information about all the genes, sorted by p-value:
+
+```{r}
+genesmd <- data.frame(chr=as.character(seqnames(rowRanges(se.filt))),
+                      symbol=rowData(se.filt)[,5],
+                      stringsAsFactors=FALSE)
+gene_id=rowData(se.filt)[,1]
+fit$genes <- genesmd
+  
+tt_smoker <- topTable(fit, coef=2, n=Inf)
+tt_smoker <- tt_smoker[order(tt_smoker$adj.P.Val),]
+dim(tt_smoker)
+head(tt_smoker)
+
+```
+
+But our goal is to get a list of DE genes, so, finally, we'll fetch the
+genes called DE with FDR \<0,1%
+
+```{r}
+DEgenes_smoker <- rownames(tt_smoker)[tt_smoker$adj.P.Val < 0.00001]
+length(DEgenes_smoker)
+```
+
+We'll now plot the distribution of *p*-values and moderated
+*t*-statistics (Figure \@ref(fig:pdistSmoker))
+
+```{r pdistSmoker, fig.cap="Distribution of p-values and moderated t-statistics on every gene between samples with that are Current smokers vs. samples that are former smokers."}
+par(mfrow=c(1,2), mar=c(4, 5, 2, 2))
+hist(tt_smoker$P.Value, xlab="Raw P-values", main="", las=1)
+qqt(fit$t[, 2], df=fit$df.prior+fit$df.residual, main="", pch=".", cex=3)
+abline(0, 1, lwd=2)
+```
+
+Another relevant one is the volcano plot (Figure \@ref(fig:pvolanoSmoker)).
+
+```{r pvolcanoSmoker, fig.cap="P-value diagnostic plot for differental expression between samples that are Current smokers and samples that are Former smokers"}
+volcanoplot(fit, coef=2, highlight=7, names=fit$genes$symbol, las=1)
+```
+
+We can see from the plots our results are highly relevant and
+statistically significant.
+
+### PML (Dysplasia)
+
+Before we start, we have to exclude the metaplasia group, seeing as it
+was excluded in the paper and we need two groups only, dysplasia vs. no
+dysplasia.
+
+```{r}
+se.filt <- se.filt[,se.filt$dysplasia!="metaplasia"]
+se.filt$dysplasia <- factor(se.filt$dysplasia, levels = c("dysplasia", "no dysplasia"))
+dim(se.filt)
+```
+
+First, we build our design matrix.
+
+```{r}
+mod <- model.matrix(~ dysplasia, data=colData(se.filt))
+head(mod)
+```
+
+Next, we fit the linear regression model
+
+```{r}
+fit <- lmFit(assays(se.filt)$logCPM, mod)
+```
+
+We calculate moderated *t-*statistics
+
+```{r}
+fit <- eBayes(fit)
+```
+
+A quick overview of the results for FDR p-value cutoff at 5% (default)
+
+```{r}
+res <- decideTests(fit)
+summary(res)
+
+summary(res)[1,2] + summary(res)[3,2]
+```
+
+We have `r summary(res)[1,2]` downregulated genes, and
+`r summary(res)[3,2]` upregulated genes, a total of
+`r summary(res)[1,2] + summary(res)[3,2]`.
+
+Seeing these results, we can afford to be a little more restricting with
+the FDR cut-off. We'll fetch the results with a p-value cut-off of 1%.
+
+```{r}
+res <- decideTests(fit, p.value=0.01)
+summary(res)
+
+summary(res)[1,2] + summary(res)[3,2]
+```
+
+We now have `r summary(res)[1,2]` downregulated genes, and
+`r summary(res)[3,2]` upregulated genes, a total of
+`r summary(res)[1,2] + summary(res)[3,2]`.
+
+And a more detailed view of the results (we'll be sure to add more
+information about the genes, so as to not only have the EntrezID
+identifier as rowname).
+
+The entire table, with information about all the genes, sorted by p-value:
+
+```{r}
+genesmd <- data.frame(chr=as.character(seqnames(rowRanges(se.filt))),
+                      symbol=rowData(se.filt)[,5],
+                      stringsAsFactors=FALSE)
+gene_id=rowData(se.filt)[,1]
+fit$genes <- genesmd
+  
+tt_dysplasia <- topTable(fit, coef=2, n=Inf)
+tt_dysplasia <- tt_dysplasia[order(tt_dysplasia$adj.P.Val),]
+dim(tt_dysplasia)
+head(tt_dysplasia)
+
+```
+
+But our goal is to get a list of DE genes, so, finally, we'll fetch the
+genes called DE with FDR \<1%
+
+```{r}
+DEgenes_dysplasia <- rownames(tt_dysplasia)[tt_dysplasia$adj.P.Val < 0.01]
+length(DEgenes_dysplasia)
+```
+
+We'll now plot the distribution of *p*-values and moderated
+*t*-statistics (Figure \@ref(fig:pdistDysplasia))
+
+```{r pdistDysplasia, fig.cap="Distribution of p-values and moderated t-statistics on every gene between samples with PML vs. without PML."}
+par(mfrow=c(1,2), mar=c(4, 5, 2, 2))
+hist(tt_dysplasia$P.Value, xlab="Raw P-values", main="", las=1)
+qqt(fit$t[, 2], df=fit$df.prior+fit$df.residual, main="", pch=".", cex=3)
+abline(0, 1, lwd=2)
+```
+
+Another relevant one is the volcano plot (Figure \@ref(fig:pvolanoDysplasia)).
+
+```{r pvolcanoDysplasia, fig.cap="P-value diagnostic plot for differental expression between samples with Dysplasia and samples without Dysplasia"}
+volcanoplot(fit, coef=2, highlight=7, names=fit$genes$symbol, las=1)
+```
+
+We can see from the plots our results are highly relevant and
+statistically significant.
+
+# Functional analysis
+
+Now, let's attempt to find DE pathways, as DE gene sets, by detecting the functional enrichment. 
+
+## Gene Ontology
+
+Firstly, we will attempt to do it with the Gene Ontology (GO) analysis which corresponds to applying the
+one-tailed Fisher's exact test to every gene set in the GO database. To execute this, we will use the
+Bioconductor package GOstats.
+
+The first step is to create our gene universe.
+
+```{r, message=FALSE}
+library(GOstats)
+library(org.Hs.eg.db)
+
+geneUniverse <- rownames(se.filt)
+```
+
+
+### Functional Analysis for Smoking Status
+
+Let's build the parameter object and use the conditional test which computes the significance of a GO term conditional on the significance of its children.
+
+```{r, message=FALSE}
+paramsSmokerStatus <- new("GOHyperGParams", geneIds=DEgenes_smoker,    
+                 universeGeneIds=geneUniverse,
+                 annotation="org.Hs.eg.db", ontology="BP",
+                 pvalueCutoff=0.05, testDirection="over")
+
+conditional(paramsSmokerStatus) <- TRUE
+```
+
+The next step is to run the functional enrichment analysis.
+
+```{r, message=FALSE}
+hgOverCondSmokerStatus <- hyperGTest(paramsSmokerStatus)
+hgOverCondSmokerStatus
+```
+And lastly to store and visualize the results. The resHgOverCond data.frame object contacts the results of the hypothesis test for each GO term,
+satisfying the P-value cutoff.
+
+```{r, message=FALSE}
+resHgOverCondSmokerStatus <- summary(hgOverCondSmokerStatus)
+dim(resHgOverCondSmokerStatus)
+head(resHgOverCondSmokerStatus)
+
+htmlReport(hgOverCondSmokerStatus, file="../doc/gotests_smoker_status.html")
+browseURL("gotests_smoker_status.html")
+```
+Check out the result <a href="../doc/gotests_smoker_status.html" target="_blank">here</a>.
+
+We do not want our GO terms to be involving too few genes or too many genes. That would make them too unreliable. So let's filter the previous results with a minimum size of 3, a maximum size of 300 and a minimum count of 3. Then we order them by the OddsRatio column.
+
+```{r, message=FALSE}
+resHgOverCondSmokerStatus <- resHgOverCondSmokerStatus[!is.infinite(resHgOverCondSmokerStatus$OddsRatio), ]
+mask <- resHgOverCondSmokerStatus$Size >= 3 & resHgOverCondSmokerStatus$Size <= 300 & resHgOverCondSmokerStatus$Count >= 3
+resHgOverCondSmokerStatus <- resHgOverCondSmokerStatus[mask, ]
+dim(resHgOverCondSmokerStatus)
+
+ord <- order(resHgOverCondSmokerStatus$OddsRatio, decreasing=TRUE)
+resHgOverCondSmokerStatus <- resHgOverCondSmokerStatus[ord, ]
+head(resHgOverCondSmokerStatus)
+```
+
+Using the geneIdsByCategory() method, we extract the genes that enrich each GO term and paste it to the result.
+
+```{r, message=FALSE}
+geneIDs <- geneIdsByCategory(hgOverCondSmokerStatus)[resHgOverCondSmokerStatus$GOBPID]
+geneSYMs <- sapply(geneIDs, function(id) select(org.Hs.eg.db, columns="SYMBOL", key=id, keytype="ENTREZID")$SYMBOL)
+geneSYMs <- sapply(geneSYMs, paste, collapse=", ")
+goresultsSmokerStatus <- cbind(resHgOverCondSmokerStatus, Genes=geneSYMs)
+rownames(goresultsSmokerStatus) <- 1:nrow(goresultsSmokerStatus)
+```
+We generate an HTML page using the knitr and kableExtra packages.
+
+```{r GOTableSmokerStatusResults, echo=FALSE}
+library(kableExtra)
+ktab <- kable(goresultsSmokerStatus, "html", caption="GO results Smoking Status")
+ktab <- kable_styling(ktab, bootstrap_options=c("stripped", "hover", "responsive"), fixed_thead=TRUE)
+save_kable(ktab, file="../doc/goresults_smoker_status.html", self_contained=TRUE)
+```
+
+See the HTML page by clicking on this <a href="../doc/goresults_smoker_status.html" target="_blank">link</a>.
+
+Table \@ref(tab:GOTableSmokerStatus2) displays the top 10 Go results (sorted by Odds Ratio).
+
+```{r GOTableSmokerStatus2, echo=FALSE}
+ktab <- kable(goresultsSmokerStatus[1:10, 2:7], "html", escape=FALSE, row.names=TRUE,
+              caption=sprintf("GO Enrichment Smoking Status"))
+kable_styling(ktab, position="center")
+```
+
+### Functional Analysis for PML (Dysplasia)
+
+Build the parameter object and use the conditional test.
+
+```{r, message=FALSE}
+paramsDysplasia <- new("GOHyperGParams", geneIds=DEgenes_dysplasia,    
+                 universeGeneIds=geneUniverse,
+                 annotation="org.Hs.eg.db", ontology="BP",
+                 pvalueCutoff=0.05, testDirection="over")
+
+conditional(paramsDysplasia) <- TRUE
+```
+
+Run the functional enrichment analysis.
+
+```{r, message=FALSE}
+hgOverCondDysplasia <- hyperGTest(paramsDysplasia)
+hgOverCondDysplasia
+```
+
+Store and visualize the results.
+
+```{r, message=FALSE}
+resHgOverCondDysplasia <- summary(hgOverCondDysplasia)
+dim(resHgOverCondDysplasia)
+head(resHgOverCondDysplasia)
+
+htmlReport(hgOverCondDysplasia, file="../doc/gotests_dysplasia.html")
+browseURL("gotests_dysplasia.html")
+```
+
+Check out the result <a href="../doc/gotests_dysplasia.html" target="_blank">here</a>.
+
+Filter the previous results with a minimum size of 3, a maximum size of 300 and a minimum count of 3 and order them by the OddsRatio column.
+
+```{r, message=FALSE}
+resHgOverCondDysplasia <- resHgOverCondDysplasia[!is.infinite(resHgOverCondDysplasia$OddsRatio), ]
+mask <- resHgOverCondDysplasia$Size >= 3 & resHgOverCondDysplasia$Size <= 300 & resHgOverCondDysplasia$Count >= 3
+resHgOverCondDysplasia <- resHgOverCondDysplasia[mask, ]
+dim(resHgOverCondDysplasia)
+
+ord <- order(resHgOverCondDysplasia$OddsRatio, decreasing=TRUE)
+resHgOverCondDysplasia <- resHgOverCondDysplasia[ord, ]
+head(resHgOverCondDysplasia)
+```
+
+Using the geneIdsByCategory() method, we extract the genes that enrich each GO term and paste it to the result.
+
+```{r, message=FALSE}
+geneIDs <- geneIdsByCategory(hgOverCondDysplasia)[resHgOverCondDysplasia$GOBPID]
+geneSYMs <- sapply(geneIDs, function(id) select(org.Hs.eg.db, columns="SYMBOL", key=id, keytype="ENTREZID")$SYMBOL)
+geneSYMs <- sapply(geneSYMs, paste, collapse=", ")
+goresultsDysplasia <- cbind(resHgOverCondDysplasia, Genes=geneSYMs)
+rownames(goresultsDysplasia) <- 1:nrow(goresultsDysplasia)
+```
+
+We generate an HTML page using the knitr and kableExtra packages.
+
+```{r GOTableDysplasiaResults, echo=FALSE}
+library(kableExtra)
+ktab <- kable(goresultsDysplasia, "html", caption="GO results Dysplasia")
+ktab <- kable_styling(ktab, bootstrap_options=c("stripped", "hover", "responsive"), fixed_thead=TRUE)
+save_kable(ktab, file="../doc/goresults_dysplasia.html", self_contained=TRUE)
+```
+
+See the HTML page by clicking on this <a href="../doc/goresults_dysplasia.html" target="_blank">link</a>.
+
+Table \@ref(tab:GOTableDysplasia2) displays the top 10 Go results (sorted by Odds Ratio).
+
+```{r GOTableDysplasia2, echo=FALSE}
+ktab <- kable(goresultsDysplasia[1:10, 2:7], "html", escape=FALSE, row.names=TRUE,
+              caption=sprintf("GO Enrichment Dysplasia"))
+kable_styling(ktab, position="center")
+```
+
+## Gene Set Enrichment Analysis
+
+The second part of the functional analysis involves performing Gene Set Enrichment Analysis (GSEA), a computational method used to determine if predefined sets of genes show statistically significant and concordant differences between two biological states (e.g., phenotypes). In our study, we will conduct GSEA for two comparisons: identifying pathways significantly enriched between current and former smokers and between the presence and absence of premalignant lesions (PMLs).
+
+### GSEA for Smoking status 
+
+We load the necessary libraries: fgsea for GSEA, GSVAdata for gene set data, and GSEABase for gene set collection handling. We load the c2BroadSets dataset, which contains gene sets from KEGG, REACTOME, and BIOCARTA pathways. 
+
+
+```{r}
+library(fgsea)
+library(GSVAdata)
+library(GSEABase)
+data(c2BroadSets)
+
+c2BroadSets <- c2BroadSets[c(grep("^KEGG", names(c2BroadSets)),
+  +                              grep("^REACTOME", names(c2BroadSets)),
+  +                              grep("^BIOCARTA", names(c2BroadSets)))]
+c2BroadSets
+```
+
+In order to do the GSEA anlysis we decided to compare our dataset with two more datasets from the MSigDB. One dataset represents the control group and the other the tumor group. We use the msigdbr library to access the Molecular Signatures Database (MSigDB) for the datasets. The dplyr library is used for data manipulation.
+
+```{r}
+
+library(msigdbr)
+library(dplyr)
+msigdb_data <- msigdbr(species = "Homo sapiens")
+str(msigdb_data)
+control <- msigdb_data %>% filter(gs_name == "DESCARTES_FETAL_LUNG_BRONCHIOLAR_AND_ALVEOLAR_EPITHELIAL_CELLS")
+tumor <- msigdb_data %>% filter(gs_name == "DING_LUNG_CANCER_MUTATED_FREQUENTLY")
+
+
+
+
+```
+
+
+We create a custom gene set using the Entrez IDs of differentially expressed genes in smoking status. We then combine this custom gene set with the previously filtered gene sets into a single Gene Set Collection (gsc).
+
+```{r}
+library(GSEABase)
+control_genes <- as.character(unique(control$entrez_gene))
+control_GS <- GeneSet(EntrezIdentifier("org.Hs.eg.db"), geneIds=control_genes, setName="CONTROL")
+details(control_GS)
+
+tumor_genes <- as.character(unique(tumor$entrez_gene))
+tumor_GS <- GeneSet(EntrezIdentifier("org.Hs.eg.db"), geneIds=tumor_genes, setName="TUMOR")
+details(tumor_GS)
+
+gsc_smoker <- GeneSetCollection(c(c2BroadSets, control_GS, tumor_GS))
+gsets_smoker <- geneIds(gsc_smoker)
+```
+
+We prepare the data by converting the histology information into factors and then into integers.
+
+```{r}
+histology_factors_smoker <- factor(se.filt$smoker)
+histology_integers_smoker <- as.integer(histology_factors_smoker)
+
+levels(histology_factors_smoker)
+histology_integers_smoker
+
+```
+
+We use the fgseaLabel function to perform GSEA by permuting phenotypes 10,000 times to compute enrichment scores and p-values for each gene set.
+```{r}
+gseapermpheno_smoker <- fgseaLabel(gsets_smoker, assays(se.filt)$logCPM, histology_integers_smoker,10000, minSize=5, maxSize=300)
+head(gseapermpheno_smoker[order(gseapermpheno_smoker$pval), ])
+```
+
+We prepare a ranked list of genes based on their differential expression statistics (tt_smoker$t).
+We then use the fgsea function to perform GSEA on this ranked list.
+``` {r}
+stats_smoker <- tt_smoker$t
+names(stats_smoker) <- rownames(tt_smoker)
+gseapermgsets_smoker <- fgsea(gsets_smoker, stats_smoker, minSize=5, maxSize=300)
+head(gseapermgsets_smoker[order(gseapermgsets_smoker$pval), ])
+```
+
+```{r}
+gseapermpheno_smoker[gseapermpheno_smoker$padj < 0.01, ]
+gseapermgsets_smoker[gseapermgsets_smoker$padj < 0.01, ]
+```
+
+```{r}
+significant_pathways_gsets_smoker <- gseapermgsets_smoker[gseapermgsets_smoker$padj < 0.01, ]
+significant_pathways_gsets_ordered_smoker <- significant_pathways_gsets_smoker[order(significant_pathways_gsets_smoker$padj), ]
+head(significant_pathways_gsets_ordered_smoker, n = 10)
+
+```
+
+We create histograms of p-values from both GSEA methods (permuting phenotypes and permuting gene sets) to visualize the distribution of p-values.
+We also generate an enrichment plot for the custom gene set DE_FC_SMOKER to show the enrichment score across the ranked gene list.
+
+```{r}
+par(mfrow=c(1, 2))
+hist(gseapermpheno_smoker$pval, xlab="P-value", main="Permuting phenotypes", las=1)
+hist(gseapermgsets_smoker$pval, xlab="P-value", main="Permuting gene sets", las=1)
+plotEnrichment(gsets_smoker$CONTROL, stats_smoker)
+plotEnrichment(gsets_smoker$TUMOR, stats_smoker)
+```
+
+We use this part of the code to identify pathways that are significantly enriched (adjusted p-value < 0.01). The plotGseaTable function then generates a table and plot of GSEA results for these significant pathways, showing the enrichment scores and p-values. This helps us visualize and interpret the most relevant pathways in our smoking status analysis.
+
+
+```{r}
+DEpwys <- gseapermgsets_smoker$pathway[gseapermgsets_smoker$padj < 0.01]
+plotGseaTable(gsets_smoker[DEpwys], stats_smoker, gseapermgsets_smoker, gseaParam=0.5)
+
+```
+
+We generate an HTML page so we can visualize more easily.
+
+```{r}
+library(kableExtra)
+gsea_tab_smoker <- kable(significant_pathways_gsets_ordered_smoker, "html", caption="GSEA Results Smoker")
+gsea_tab_smoker <- kable_styling(gsea_tab_smoker, bootstrap_options=c("stripped", "hover", "responsive"), fixed_thead=TRUE)
+save_kable(gsea_tab_smoker, file="../doc/gsea_results_smoker.html", self_contained=TRUE)
+```
+
+See the HTML page by clicking on this <a href="../doc/gsea_results_smoker.html" target="_blank">link</a>.
+
+
+We use the limma::camera function to perform an additional gene set analysis that adjusts for inter-gene correlation within gene sets. This step enhances the robustness of our findings by providing an alternative method to validate the significant pathways identified by GSEA. The camera function uses the same gene sets and design matrix as our previous analyses.
+
+```{r}
+gsetidx_smoker <- ids2indices(geneIds(gsc_smoker), rownames(se.filt))
+camerares_smoker <- camera(y=assays(se.filt)$logCPM, index=gsetidx_smoker, design=mod, contrast=2)
+head(camerares_smoker, 5)
+```
+
+
+We filter the Camera results to focus on pathways with an FDR < 0.01, ensuring we only consider the most significant pathways. This step helps us further refine our list of relevant pathways.
+```{r}
+camerares_smoker[camerares_smoker$FDR < 0.01, ]
+```
+
+We create a histogram of the p-values from the Camera results to visualize the distribution of significance levels across all tested pathways. This plot provides an overview of the significance of the pathways in relation to dysplasia.
+```{r}
+hist(camerares_smoker$PValue, xlab="P-value", main="Camera", las=1)
+```
+
+
+### GSEA for Dysplasia (PML)
+
+We do the same steps as previously but now for the Dysplasia.
+Load the required libraries and data.
+
+```{r}
+library(fgsea)
+library(GSVAdata)
+library(GSEABase)
+data(c2BroadSets)
+
+c2BroadSets <- c2BroadSets[c(grep("^KEGG", names(c2BroadSets)),
+  +                              grep("^REACTOME", names(c2BroadSets)),
+  +                              grep("^BIOCARTA", names(c2BroadSets)))]
+c2BroadSets
+
+```
+
+Create a costum gene set for Dysplasia.
+
+```{r}
+
+library(GSEABase)
+control_genes <- as.character(unique(control$entrez_gene))
+control_GS <- GeneSet(EntrezIdentifier("org.Hs.eg.db"), geneIds=control_genes, setName="CONTROL")
+details(control_GS)
+
+tumor_genes <- as.character(unique(tumor$entrez_gene))
+tumor_GS <- GeneSet(EntrezIdentifier("org.Hs.eg.db"), geneIds=tumor_genes, setName="TUMOR")
+details(tumor_GS)
+
+gsc_dysplasia <- GeneSetCollection(c(c2BroadSets, control_GS, tumor_GS))
+gsets_dysplasia<- geneIds(gsc_dysplasia)
+
+  
+```
+
+Prepare the data.
+```{r}
+
+histology_factors_dysplasia <- factor(se.filt$dysplasia)
+histology_integers_dysplasia <- as.integer(histology_factors_dysplasia)
+
+levels(histology_factors_dysplasia)
+histology_integers_dysplasia
+```
+
+
+Run the GSEA by permuting phenotypes.
+```{r}
+
+gseapermpheno_dysplasia <- fgseaLabel(gsets_dysplasia, assays(se.filt)$logCPM, histology_integers_dysplasia,10000, minSize=5, maxSize=300)
+head(gseapermpheno_dysplasia[order(gseapermpheno_dysplasia$pval)])
+
+```
+
+Run GSEA with the ranked gene list.
+
+``` {r}
+stats_dysplasia <- tt_dysplasia$t
+names(stats_dysplasia) <- rownames(tt_dysplasia)
+gseapermgsets_dysplasia <- fgsea(gsets_dysplasia, stats_dysplasia, minSize=5, maxSize=300)
+head(gseapermgsets_dysplasia[order(gseapermgsets_dysplasia$pval), ])
+```
+
+```{r}
+gseapermpheno_dysplasia[gseapermpheno_dysplasia$padj < 0.01, ]
+gseapermgsets_dysplasia[gseapermgsets_dysplasia$padj < 0.01, ]
+
+```
+
+```{r}
+significant_pathways_gsets_dysplasia <- gseapermgsets_dysplasia[gseapermgsets_dysplasia$padj < 0.01, ]
+significant_pathways_gsets_ordered_dysplasia <- significant_pathways_gsets_dysplasia[order(significant_pathways_gsets_dysplasia$padj), ]
+head(significant_pathways_gsets_ordered_dysplasia, n = 10)
+
+```
+
+Create histograms of p-values and generate an enrichment plot.
+```{r}
+par(mfrow=c(1, 2))
+hist(gseapermpheno_dysplasia$pval, xlab="P-value", main="Permuting phenotypes", las=1)
+hist(gseapermgsets_dysplasia$pval, xlab="P-value", main="Permuting gene sets", las=1)
+plotEnrichment(gsets_dysplasia$CONTROL, stats_dysplasia)
+plotEnrichment(gsets_dysplasia$TUMOR, stats_dysplasia)
+
+```
+
+Identify significant pathways. 
+
+```{r}
+DEpwys_dysplasia <- significant_pathways_gsets_ordered_dysplasia$pathway
+plotGseaTable(gsets_dysplasia[DEpwys_dysplasia], stats_dysplasia, gseapermgsets_dysplasia, gseaParam=0.5)
+
+```
+
+We generate an HTML page so we can visualize more easily.
+```{r}
+library(kableExtra)
+gsea_tab <- kable(significant_pathways_gsets_ordered_dysplasia, "html", caption="GSEA Results Dysplasia")
+gsea_tab <- kable_styling(gsea_tab, bootstrap_options=c("stripped", "hover", "responsive"), fixed_thead=TRUE)
+save_kable(gsea_tab, file="../doc/gsea_results_dysplasia.html", self_contained=TRUE)
+```
+See the HTML page by clicking on this <a href="../doc/gsea_results_dysplasia.html" target="_blank">link</a>.
+
+
+
+Additional validation using Camera.
+
+
+```{r}
+library(limma)
+gsetidx_dysplasia <- ids2indices(geneIds(gsc_dysplasia), rownames(se.filt))
+camerares_dysplasia <- camera(y=assays(se.filt)$logCPM, index=gsetidx_dysplasia, design=mod, contrast=2)
+head(camerares_dysplasia, 5)
+```
+
+
+Filter significant pathways from Camera.
+
+```{r}
+camerares_dysplasia[camerares_dysplasia$FDR < 0.01, ]
+```
+
+
+Visualise significant pathways from Camera for Dysplasia.
+
+```{r}
+hist(camerares_dysplasia$PValue, xlab="P-value", main="Camera", las=1)
+```
+
+
+
+# Discussion
+
+We ended up following two different pipelines and therefore reached two sets of differentially expressed genes and pathways. This proved to be fruitful seeing as both current vs. former smokers and dysplasia vs. no dysplasia have statistically significant differencial expression. The results of the differential expression were significant enough to perform functional analysis on and find out how the genome changes between current smokers vs former smokers, and how does it affect the state of their ariway tissue (dysplasia).
+
+We decided on this aim for our analysis because of the results we got from doing Experimental Data Analysis on the dataset. We looked at all of the phenotypical and technical variables to find something that may be worth of interest or that might output statistical significant results. What we found during Experimental Dessign and batch identification is that our samples clustered together (with some exceptions) in two groups. After some trial and error, we found the reason for this clustering is the divide between the groups of samples that are current smokers vs. former smokers. We went ahead and decided to explore this path.
+
+A second analysis seemed pertinent, on a different variable to be able to compare the two. Dysplasia vs. no dysplasia was an appropriate group, especially since it describes the state of damage of the tissue, which should be related to wether or not someone smokes.
+
+As we suspected during EDA and Experimental Design, the results from our Differential Expression Analysis in Current smokers vs. Former smokers were of high statistical significance. We found a very high number of DE genes, some of the top ones being up until 26 times more upregulated in one group. Our distribution of p-values shows how most of them are very close to 0, and the volcano plot also helps confirm there is significant Differential Gene Expression between samples belonging to former smokers vs. samples belonging to current smokers.
+
+In our analysis, we aimed to explore the effects of smoking on cellular functions using Gene Set Enrichment Analysis (GSEA) and Gene Ontology (GO) analysis. We conducted these analyses on samples with dysplasia versus no dysplasia and current smokers versus former smokers.
+
+Both GSEA and GO analysis in our sets of DE genes (dysplasia vs no dysplasia and current vs former smoker) revealed that smoking significantly impacts various cellular pathways, particularly those related to ribosomal function, protein synthesis, mitochondrial function, and metabolic processes (REACTOME_TRANSLATION, REACTOME_GTP_HYDROLYSIS_AND_JOINING_OF_THE_60S_RIBOSOMAL_SUBUNIT and REACTOME_FORMATION_OF_A_POOL_OF_FREE_40S_SUBUNITS). This illustrates that chronic exposure to cigarette smoke can lead to oxidative stress, damaging cellular components and disrupting normal protein synthesis and function.
+
+Smoking affects the expression and function of ribosomal proteins, which are critical for protein biogenesis (KEGG_RIBOSOME). Our findings align with the study by @Park21, which also identified a detrimental effect of smoking on ribosomal function and protein synthesis. Exposure to electronic cigarette smoke reduces ribosomal protein gene expression, impairing protein synthesis in primary human airway epithelial cells. The reduced expression of ribosomal proteins and subsequent impairment in protein synthesis could lead to various cellular dysfunctions and contribute to the pathogenesis of various smoking-related diseases, including cancer. 
+
+Further findings indicate that smoking disrupts cytoplasmic translation and peptide chain elongation (REACTOME_PEPTIDE_CHAIN_ELONGATION). The study by @Merzah23 supports these observations, revealing differentially expressed genes (DEGs) related to immune response and inflammation pathways in smokers. Smoking leads to significant downregulation of genes involved in oxygen binding and activity, emphasizing the role of oxidative stress in disrupting cellular functions, contributing to disease development.
+
+Additionally, our analyses identified pathways related to mitochondrial electron transport and ATP synthesis (KEGG_OXIDATIVE_PHOSPHORYLATION). Smoking introduces numerous toxins that induce oxidative stress, resulting in the production of reactive oxygen species (ROS), which can damage cellular components, including mitochondria. This oxidative stress impairs mitochondrial function, leading to a cascade of detrimental effects on cellular health. The study by @Kanithi22 highlighted the impact of cigarette smoke and e-cigarette vapor on mitochondrial function by increasing oxidative stress, disrupting mitochondrial morphology, and impairing critical processes such as fusion, fission, and mitophagy.
+
+Smoking-induced oxidative stress damages the electron transport chain, leading to reduced ATP production and impaired cellular energy metabolism. The resulting energy deficit can hinder cellular processes, contributing to the development of diseases such as cancer and cardiovascular conditions. The study by @Tan08 concluded that cigarette smoke exposure affects mtDNA in buccal cells of smokers. Additionally, @Fetterman17 reported that active and passive cigarette smoke decreases mitochondrial respiration and membrane potential, leading to decreased ATP content and increased oxidant production in various tissues, exacerbating cellular dysfunction and contributing to smoking-related diseases.
+
+Pathways like REACTOME_INSULIN_SYNTHESIS_AND_SECRETION and REACTOME_GLUCOS_REGULATION_OF_INSULIN_SECRETION point to potential disruptions in insulin signaling. Smoking has been associated with insulin resistance (@Facchini92) and an increased risk of developing type 2 diabetes (@Will01) This could be due to inflammation and oxidative stress induced by smoking, affecting pancreatic beta cells' ability to produce insulin and cells' sensitivity to insulin.
+
+GO terms such as tryptophan transport, valine transport, and thyroid hormone transport highlight changes in the transport of essential molecules. Smoking can alter the expression of various transporters on cell membranes, impacting nutrient uptake and hormone distribution. @Babic21 concluded that smoking leads to a decrease in TSH levels and an increase in T3 and T4 levels. The mechanism through which cigarette smoking affects TSH and thyroid hormone levels remains unclear. Changes in amino acid transport can affect protein synthesis and cellular repair mechanisms.
+
+The GO terms daunorubicin metabolic process and doxorubicin metabolic process suggest differences in how former and current smokers metabolize specific substances. These findings align with research showing that smoking induces certain cytochrome P450 enzymes involved in drug metabolism, leading to altered pharmacokinetics and potentially affecting the efficacy and toxicity of various medications (@Zhao21).
+
+Collectively, these findings underscore the broad impact of smoking on critical biological functions, affecting everything from protein synthesis to metabolic and transport processes. The impairment of these pathways highlights the profound and multifaceted consequences of smoking on cellular health, contributing to the development of various smoking-related diseases.
+
+# Conclusions
+
+Differential Expression and Functional Analysis allowed us to identify differentially expressed genes and pathways between current smokers and former smokers, as well as samples with damaged lung tissue (dysplasia) vs. healthy lung tissue (no dysplasia).
+
+We wanted to gain some insight into the effects of smoking on the airway, and whether or not there is significance in smokers vs. people that quit smoking. The fact that there is very significant differential expression between these groups, and that there are pathways that are differentially expressed, tells us that there are significant changes to the genome once the smoking stops. Comparing it to dysplasia status, and seeing so many pathways that are differentially expressed in one classification as well as the other, could indicate there's a correlation between Histology degree and the smoking habit.
+
+In our analysis of the effects of smoking on cellular functions using Differential Expression (DE), Gene Ontology (GO), and Gene Set Enrichment Analysis (GSEA) on RNA-seq data, we discovered significant molecular alterations between current and former smokers, and individuals with and without dysplasia.
+
+Even though our process did yield significant results, we think it's still superficial. We could add to this analysis by also sequencing genome from samples that never smoked, or try and go further into the changes the genome goes through once one stops smoking. We think this is a very relevant topic seeing as smoking is still really prevalent, and lung cancer is one of the leading causes of death in the United States.
+
+
+# Session information
+
+```{r}
+sessionInfo()
+```
+
+# References
